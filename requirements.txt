@@ -9,3 +9,4 @@ pydantic==2.9.0
 python-dotenv==1.0.1
 pytest==8.3.0
 pytest-asyncio==0.24.0
+fakeredis[lua]==2.26.0

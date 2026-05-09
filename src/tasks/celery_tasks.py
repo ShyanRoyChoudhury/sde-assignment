@@ -1,114 +1,257 @@
 """
-Celery tasks for post-call processing.
+Celery tasks for the post-call processing pipeline (SUBMISSION.md §3.2).
 
-This is the main background processing pipeline. Every completed interaction
-with a long transcript ends up here.
+Each stage is its own task on its own queue so workers can be scaled
+independently:
 
-The task runs five steps sequentially:
-    1. Wait 45s, try to fetch recording from Exotel → upload to S3
-    2. Run full LLM analysis on the transcript
-    3. Write result to interaction_metadata (dashboard cache)
-    4. Trigger signal jobs (downstream actions: WhatsApp, callbacks, etc.)
-    5. Update lead stage
+    triage        →  CPU-bound, ~1ms per call, trivially parallel
+    postcall_hot  →  I/O-bound, rate-limited, reserved capacity first
+    postcall_cold →  I/O-bound, rate-limited, burst-only, defers when contested
+    recording     →  I/O-bound, polls Exotel with bounded backoff
+    outbox        →  I/O-bound, fans out to downstream services with retry
 
-A few things worth understanding before you start changing things:
-
-WHY CELERY + REDIS?
-  We needed a task queue and Celery was already in the stack. Redis was already
-  in the stack. It worked fine at 1K calls/day. At 100K calls/campaign the cracks
-  show: broker restarts lose tasks, queue depth is invisible, and there's no way
-  to see which step a given interaction is stuck on.
-
-WHY ONE QUEUE?
-  Originally there was only one customer. One queue was fine. We never revisited
-  it when the platform became multi-customer. Now a campaign for Customer A can
-  fill the queue and delay Customer B's results by hours.
-
-WHY DOES RECORDING BLOCK ANALYSIS?
-  It shouldn't. Recording upload and LLM analysis are completely independent —
-  the LLM reads the transcript, not the audio file. But they're sequential here
-  because that's how the task was originally written and nobody had a reason to
-  split them until the 45-second sleep became a visible SLA problem.
-
-  Think about what "run them in parallel" would require at the infrastructure level.
+Beat tasks:
+    sweeper             →  reclaim stranded TPM ledger reservations
+    pressure_publish    →  refresh the platform_pressure gauge
+    outbox_beat         →  enqueue per-row dispatch tasks
+    outbox_reconcile    →  reset outbox rows stuck in 'in_progress'
+    recording_reconcile →  reset interactions stuck in 'uploading'
 """
 
 import asyncio
+import json
 import logging
+import uuid
 from datetime import datetime
 from typing import Any, Dict
 
+from sqlalchemy import text
+
+from src.config import settings
+from src.services.event_log import Stage, Status, write as write_event
+from src.services.outbox import (
+    dispatch_row,
+    fetch_dispatch_batch,
+    insert_outbox_row,
+    reconcile_stuck_in_progress,
+)
+from src.services.post_call_processor import (
+    BudgetDenied,
+    PostCallContext,
+    post_call_processor,
+)
+from src.services.pressure_gauge import publish_pressure
+from src.services.recording import (
+    FetchStatus,
+    fetch_exotel_recording,
+    find_stuck_uploads,
+    poll_delay_for_attempt,
+    update_recording_status,
+    upload_to_s3,
+)
+from src.services.tpm_ledger import tpm_ledger
+from src.services.triage import classify
 from src.tasks.celery_app import celery_app
-from src.services.post_call_processor import PostCallProcessor, PostCallContext
-from src.services.recording import fetch_and_upload_recording
-from src.services.signal_jobs import trigger_signal_jobs, update_lead_stage
-from src.services.retry_queue import retry_queue
-from src.services.metrics import metrics_tracker
+from src.utils.db import async_session_factory
 
 logger = logging.getLogger(__name__)
 
 
-@celery_app.task(
-    name="process_interaction_end_background_task",
-    bind=True,
-    max_retries=3,
-    default_retry_delay=60,  # Fixed 60s — no exponential backoff
-    acks_late=True,           # Task only acked after completion, not on receipt.
-                              # This means a worker crash causes redelivery — good.
-                              # But "redelivery" goes to the back of the queue,
-                              # which at 100K depth means hours of extra wait.
-    queue="postcall_processing",
-)
-def process_interaction_end_background_task(self, payload: Dict[str, Any]):
-    """
-    Main Celery task. Called for every long-transcript interaction.
-
-    Celery workers are synchronous by default, so we spin up an event loop
-    per task to run the async processing code. This means each Celery worker
-    process handles one interaction at a time — no concurrency within a worker.
-
-    At 100K interactions/campaign with ~3,500ms LLM latency per call:
-        100,000 × 3.5s = 350,000 worker-seconds needed
-        With 10 workers: ~9.7 hours to drain the queue
-
-    If your campaign window is 8 hours, you're already behind before you start.
-    """
+def _run_async(coro):
+    """Run an async coroutine inside a fresh event loop. Used by sync Celery tasks."""
     loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     try:
-        loop.run_until_complete(_process_interaction(self, payload))
-    except Exception as e:
-        logger.exception(
-            "celery_task_failed",
-            extra={
-                "interaction_id": payload.get("interaction_id"),
-                "error": str(e),
-                "attempt": self.request.retries,
-            },
-        )
-        # Failed tasks go into PostCallRetryQueue (Redis) AND Celery retries.
-        # Two retry mechanisms that don't know about each other. An interaction
-        # can end up being processed twice if both fire.
-        loop.run_until_complete(
-            retry_queue.enqueue_retry(
-                interaction_id=payload["interaction_id"],
-                error=str(e),
-                payload=payload,
-            )
-        )
-        raise self.retry(exc=e)
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
     finally:
         loop.close()
 
 
-async def _process_interaction(task, payload: Dict[str, Any]):
+# ──────────────────────────────────────────────────────────────────────────────
+# Triage task — first stage; routes into skip / hot / cold
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@celery_app.task(name="triage_task", bind=True, queue=settings.QUEUE_TRIAGE,
+                 acks_late=True, max_retries=3, default_retry_delay=10)
+def triage_task(self, payload: Dict[str, Any]) -> None:
+    try:
+        _run_async(_triage_async(payload))
+    except Exception as e:
+        logger.exception("triage_task_failed",
+                         extra={"interaction_id": payload.get("interaction_id"),
+                                "trace_id": payload.get("trace_id"),
+                                "error": str(e)})
+        # Triage failures are rare. Retry a few times; if all retries fail,
+        # the failed task itself goes to the standard Celery DLQ via acks_late
+        # behaviour. Adding a DLQ row is handled by the analyse path.
+        raise self.retry(exc=e)
+
+
+async def _triage_async(payload: Dict[str, Any]) -> None:
     interaction_id = payload["interaction_id"]
+    trace_id = payload["trace_id"]
 
-    await metrics_tracker.track_processing_started(interaction_id)
+    # Read the interaction row to get transcript + customer/lead/campaign IDs.
+    row = await _load_interaction(interaction_id)
+    if row is None:
+        logger.warning("triage_interaction_not_found",
+                       extra={"interaction_id": interaction_id, "trace_id": trace_id})
+        return
 
-    ctx = PostCallContext(
+    transcript = (row["conversation_data"] or {}).get("transcript", []) or []
+    transcript_text = "\n".join(
+        f"{turn.get('role', 'unknown')}: {turn.get('content', '')}"
+        for turn in transcript
+    )
+    turn_count = len(transcript)
+
+    verdict = classify(transcript_text, turn_count)
+
+    await _update_interaction_lane(interaction_id, verdict.lane, verdict)
+    await write_event(
         interaction_id=interaction_id,
+        trace_id=trace_id,
+        stage=Stage.TRIAGED,
+        status=Status.SUCCESS,
+        source="classifier",
+        metadata={
+            "lane": verdict.lane,
+            "suggested_call_stage": verdict.suggested_call_stage,
+            "matched_rules": verdict.matched_rules,
+        },
+    )
+
+    if verdict.lane == "skip":
+        await _emit_skip_result(row, trace_id, verdict)
+        return
+
+    # Hot or cold — enqueue the analyse task on the appropriate queue.
+    queue = settings.QUEUE_HOT if verdict.lane == "hot" else settings.QUEUE_COLD
+    analyse_payload = {
+        **payload,
+        "lane": verdict.lane,
+        "suggested_call_stage": verdict.suggested_call_stage,
+        "lead_id": str(row["lead_id"]),
+        "campaign_id": str(row["campaign_id"]),
+        "customer_id": str(row["customer_id"]),
+        "agent_id": str(row["agent_id"]),
+        "transcript_text": transcript_text,
+        "conversation_data": row["conversation_data"] or {},
+        "queue": queue,
+    }
+    analyse_task.apply_async(args=[analyse_payload], queue=queue)
+
+
+async def _emit_skip_result(row: Dict[str, Any], trace_id: str, verdict) -> None:
+    """Skip path — synthesise an analysis result without an LLM call (§6.3)."""
+    interaction_id = str(row["id"])
+    customer_id = str(row["customer_id"])
+
+    synthetic_payload = {
+        "call_stage": verdict.suggested_call_stage,
+        "entities": {},
+        "summary": f"Auto-classified: {verdict.suggested_call_stage}",
+        "tokens_used": 0,
+        "provider": "classifier",
+        "model": "rules-v1",
+        "analyzed_at": datetime.utcnow().isoformat(),
+    }
+
+    async with async_session_factory() as session:
+        # Idempotent write — same anchor as the LLM path.
+        await session.execute(
+            text(
+                """
+                UPDATE interactions
+                SET interaction_metadata = interaction_metadata || CAST(:patch AS jsonb),
+                    analyzed_at = NOW(),
+                    status = 'ANALYSIS_SKIPPED',
+                    updated_at = NOW()
+                WHERE id = CAST(:id AS uuid) AND analyzed_at IS NULL
+                """
+            ),
+            {"id": interaction_id, "patch": json.dumps(synthetic_payload)},
+        )
+
+        # Outbox rows in the same transaction.
+        await insert_outbox_row(
+            interaction_id=interaction_id,
+            customer_id=customer_id,
+            trace_id=trace_id,
+            dispatch_type="signal_jobs",
+            payload={
+                "interaction_id": interaction_id,
+                "session_id": str(row["session_id"]),
+                "campaign_id": str(row["campaign_id"]),
+                "trace_id": trace_id,
+                "call_stage": verdict.suggested_call_stage,
+                "analysis_result": synthetic_payload,
+            },
+            session=session,
+        )
+        await insert_outbox_row(
+            interaction_id=interaction_id,
+            customer_id=customer_id,
+            trace_id=trace_id,
+            dispatch_type="lead_stage",
+            payload={
+                "lead_id": str(row["lead_id"]),
+                "interaction_id": interaction_id,
+                "trace_id": trace_id,
+                "call_stage": verdict.suggested_call_stage,
+            },
+            session=session,
+        )
+        await session.commit()
+
+    await write_event(
+        interaction_id=interaction_id,
+        trace_id=trace_id,
+        stage=Stage.ANALYZED,
+        status=Status.SUCCESS,
+        source="classifier",
+        metadata={
+            "tokens_used": 0,
+            "model": "rules-v1",
+            "call_stage": verdict.suggested_call_stage,
+        },
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Analyse task — LLM call, gated by TPM ledger
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@celery_app.task(name="analyse_task", bind=True, acks_late=True,
+                 max_retries=settings.MAX_DEFER_ATTEMPTS,
+                 default_retry_delay=settings.MIN_RETRY_BACKOFF_MS // 1000)
+def analyse_task(self, payload: Dict[str, Any]) -> None:
+    try:
+        _run_async(_analyse_async(payload, self.request.retries))
+    except BudgetDenied as e:
+        # Defer per §4.7 — the LLM was never called. Reschedule with the
+        # ledger's recommended backoff.
+        countdown = max(1, e.retry_after_ms // 1000)
+        _record_defer(payload, e.reason, e.retry_after_ms, self.request.retries)
+        raise self.retry(exc=e, countdown=countdown,
+                         max_retries=settings.MAX_DEFER_ATTEMPTS)
+    except Exception as e:
+        logger.exception("analyse_task_failed",
+                         extra={"interaction_id": payload.get("interaction_id"),
+                                "trace_id": payload.get("trace_id"),
+                                "error": str(e)})
+        # Non-budget failures: limited retries; on exhaustion, DLQ.
+        if self.request.retries >= 3:
+            _run_async(_dlq_analysis_failure(payload, str(e), self.request.retries))
+            return
+        raise self.retry(exc=e, countdown=60)
+
+
+async def _analyse_async(payload: Dict[str, Any], attempt: int) -> None:
+    ctx = PostCallContext(
+        interaction_id=payload["interaction_id"],
         session_id=payload["session_id"],
         lead_id=payload["lead_id"],
         campaign_id=payload["campaign_id"],
@@ -120,70 +263,346 @@ async def _process_interaction(task, payload: Dict[str, Any]):
         additional_data=payload.get("additional_data", {}),
         ended_at=datetime.fromisoformat(payload["ended_at"]),
         exotel_account_id=payload.get("exotel_account_id"),
+        trace_id=payload["trace_id"],
+        classifier_hint=payload.get("suggested_call_stage"),
     )
+    lane = payload.get("lane", "hot")
 
-    # ── Step 1: Recording ─────────────────────────────────────────────────────
-    # Blocks here for ~45 seconds waiting for Exotel to make the recording
-    # available. The LLM analysis (step 2) cannot start until this completes,
-    # even though it has zero dependency on the recording.
-    #
-    # Under load, recordings often arrive in 10–15s. We wait 45s anyway.
-    # Sometimes they arrive after 60s. We've already given up by then.
-    recording_s3_key = await fetch_and_upload_recording(
+    await write_event(
         interaction_id=ctx.interaction_id,
-        call_sid=ctx.call_sid,
-        exotel_account_id=ctx.exotel_account_id or "",
+        trace_id=ctx.trace_id,
+        stage=Stage.ANALYZE_ACQUIRED,
+        status=Status.IN_PROGRESS,
+        source="ledger",
+        metadata={"customer_id": ctx.customer_id, "lane": lane, "attempt": attempt},
     )
 
-    if recording_s3_key:
-        logger.info(
-            "recording_uploaded",
-            extra={"interaction_id": interaction_id, "s3_key": recording_s3_key},
+    result = await post_call_processor.process(ctx, lane=lane)
+
+    # Outbox rows for downstream side effects, atomic with the analysis result.
+    async with async_session_factory() as session:
+        await insert_outbox_row(
+            interaction_id=ctx.interaction_id,
+            customer_id=ctx.customer_id,
+            trace_id=ctx.trace_id,
+            dispatch_type="signal_jobs",
+            payload={
+                "interaction_id": ctx.interaction_id,
+                "session_id": ctx.session_id,
+                "campaign_id": ctx.campaign_id,
+                "trace_id": ctx.trace_id,
+                "call_stage": result.call_stage,
+                "analysis_result": result.raw_response,
+            },
+            session=session,
         )
-    # If recording_s3_key is None, we continue silently. No alert, no retry,
-    # no flag on the interaction. The recording is just gone.
+        await insert_outbox_row(
+            interaction_id=ctx.interaction_id,
+            customer_id=ctx.customer_id,
+            trace_id=ctx.trace_id,
+            dispatch_type="lead_stage",
+            payload={
+                "lead_id": ctx.lead_id,
+                "interaction_id": ctx.interaction_id,
+                "trace_id": ctx.trace_id,
+                "call_stage": result.call_stage,
+            },
+            session=session,
+        )
+        await session.commit()
 
-    # ── Step 2: LLM analysis ──────────────────────────────────────────────────
-    # Full analysis on every call. 1,500 tokens average. No pre-screening.
-    # A call where the customer said "wrong number" after one sentence gets the
-    # same treatment as a confirmed rebook.
-    #
-    # The LLM rate limit (settings.LLM_TOKENS_PER_MINUTE) is not checked before
-    # this call. If we're over the limit, the provider returns a 429 and this
-    # raises an exception, which triggers Celery retry — which goes to the back
-    # of the 100K-item queue and makes the problem worse.
-    processor = PostCallProcessor()
-    result = await processor.process_post_call(ctx, single_prompt=True)
-
-    await metrics_tracker.track_processing_completed(
-        interaction_id, result.tokens_used, result.latency_ms
+    await write_event(
+        interaction_id=ctx.interaction_id,
+        trace_id=ctx.trace_id,
+        stage=Stage.ANALYZED,
+        status=Status.SUCCESS,
+        source="llm",
+        metadata={
+            "tokens_used": result.tokens_used,
+            "latency_ms": result.latency_ms,
+            "model": result.model,
+            "call_stage": result.call_stage,
+        },
+    )
+    await write_event(
+        interaction_id=ctx.interaction_id,
+        trace_id=ctx.trace_id,
+        stage=Stage.OUTBOX_INSERTED,
+        status=Status.SUCCESS,
+        source="analyse",
+        metadata={"dispatch_types": ["signal_jobs", "lead_stage"]},
     )
 
-    # ── Step 3: Signal jobs ───────────────────────────────────────────────────
-    # Downstream actions: send a WhatsApp follow-up, book a callback slot,
-    # push to the customer's CRM. These depend on knowing the analysis result.
-    #
-    # If this raises, we log a warning and continue — the lead stage still
-    # updates. But the downstream action (WhatsApp, callback, CRM push) is lost.
-    try:
-        await trigger_signal_jobs(
-            interaction_id=ctx.interaction_id,
-            session_id=ctx.session_id,
-            campaign_id=ctx.campaign_id,
-            analysis_result=result.raw_response,
-        )
-    except Exception as e:
-        logger.warning("signal_jobs_failed", extra={"error": str(e)})
 
-    # ── Step 4: Lead stage update ─────────────────────────────────────────────
-    # Updates the lead's stage in the leads table based on call_stage.
-    # e.g., "rebook_confirmed" → lead moves to "booked" stage.
-    # Same fire-and-forget risk as signal_jobs above.
+def _record_defer(payload, reason, retry_after_ms, attempt):
+    _run_async(write_event(
+        interaction_id=payload["interaction_id"],
+        trace_id=payload["trace_id"],
+        stage=Stage.ANALYZE_DEFERRED,
+        status=Status.DEFERRED,
+        source="ledger",
+        metadata={"reason": reason, "retry_after_ms": retry_after_ms, "attempt": attempt},
+    ))
+
+
+async def _dlq_analysis_failure(payload: Dict[str, Any], error: str, attempt: int) -> None:
+    from src.services.dlq import write_dlq_entry
+    dlq_id = await write_dlq_entry(
+        source="analysis",
+        reason="exceeded_retries",
+        original_payload=payload,
+        error_history=[{"attempt": attempt, "error": error}],
+        interaction_id=payload.get("interaction_id"),
+        customer_id=payload.get("customer_id"),
+        trace_id=payload.get("trace_id"),
+    )
+    await write_event(
+        interaction_id=payload["interaction_id"],
+        trace_id=payload["trace_id"],
+        stage=Stage.DEAD_LETTERED,
+        status=Status.FAILED,
+        source="analyse",
+        metadata={"source": "analysis", "reason": "exceeded_retries", "dlq_id": dlq_id},
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Recording task — bounded poll, parallel to triage/analyse
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@celery_app.task(name="poll_recording", bind=True, queue=settings.QUEUE_RECORDING,
+                 acks_late=True, max_retries=10)
+def poll_recording(self, interaction_id: str, trace_id: str,
+                   exotel_account_id: str, call_sid: str, attempt: int = 1) -> None:
     try:
-        await update_lead_stage(
-            lead_id=ctx.lead_id,
-            interaction_id=ctx.interaction_id,
-            call_stage=result.call_stage,
-        )
+        _run_async(_poll_recording_async(
+            interaction_id, trace_id, exotel_account_id, call_sid, attempt
+        ))
+    except _RetryAfter as ra:
+        raise self.retry(countdown=ra.countdown, max_retries=10,
+                         kwargs={"attempt": ra.next_attempt})
     except Exception as e:
-        logger.warning("lead_stage_update_failed", extra={"error": str(e)})
+        logger.exception("poll_recording_failed",
+                         extra={"interaction_id": interaction_id,
+                                "trace_id": trace_id,
+                                "error": str(e)})
+        # Don't retry on unexpected errors — mark terminal.
+        _run_async(update_recording_status(
+            interaction_id, "fetch_error",
+            is_terminal=True, bump_attempt=True,
+        ))
+
+
+class _RetryAfter(Exception):
+    def __init__(self, countdown: float, next_attempt: int):
+        self.countdown = countdown
+        self.next_attempt = next_attempt
+
+
+async def _poll_recording_async(interaction_id, trace_id, account_sid, call_sid, attempt):
+    await update_recording_status(interaction_id, "pending", bump_attempt=True)
+    result = await fetch_exotel_recording(call_sid, account_sid)
+
+    await write_event(
+        interaction_id=interaction_id,
+        trace_id=trace_id,
+        stage=Stage.RECORDING_POLL,
+        status=Status.SUCCESS if result.status == FetchStatus.READY else Status.IN_PROGRESS,
+        source="recording_poller",
+        metadata={"attempt": attempt, "poll_status": result.status.value,
+                  "error_detail": result.error_detail},
+    )
+
+    if result.status == FetchStatus.READY:
+        await update_recording_status(interaction_id, "uploading")
+        try:
+            s3_key = await upload_to_s3(result.url, interaction_id)
+        except Exception:
+            await update_recording_status(
+                interaction_id, "fetch_error",
+                is_terminal=True, bump_attempt=False,
+            )
+            raise
+        await update_recording_status(
+            interaction_id, "uploaded",
+            s3_key=s3_key, is_terminal=True, bump_attempt=False,
+        )
+        await write_event(
+            interaction_id=interaction_id, trace_id=trace_id,
+            stage=Stage.RECORDING_TERMINAL, status=Status.SUCCESS,
+            source="recording_poller",
+            metadata={"terminal_status": "uploaded", "attempt_count": attempt},
+        )
+        return
+
+    if result.status == FetchStatus.PERMANENT_ERROR:
+        await update_recording_status(
+            interaction_id, "fetch_error",
+            is_terminal=True, bump_attempt=False,
+        )
+        await write_event(
+            interaction_id=interaction_id, trace_id=trace_id,
+            stage=Stage.RECORDING_TERMINAL, status=Status.FAILED,
+            source="recording_poller",
+            metadata={"terminal_status": "fetch_error", "reason": result.error_detail},
+        )
+        return
+
+    # not_ready or transient_error — retry per schedule
+    next_attempt = attempt + 1
+    delay = poll_delay_for_attempt(next_attempt)
+    if delay is None:
+        # Schedule exhausted.
+        terminal = "unavailable" if result.status == FetchStatus.NOT_READY else "fetch_error"
+        await update_recording_status(
+            interaction_id, terminal,
+            is_terminal=True, bump_attempt=False,
+        )
+        await write_event(
+            interaction_id=interaction_id, trace_id=trace_id,
+            stage=Stage.RECORDING_TERMINAL, status=Status.FAILED,
+            source="recording_poller",
+            metadata={"terminal_status": terminal, "attempt_count": attempt},
+        )
+        return
+
+    raise _RetryAfter(countdown=delay, next_attempt=next_attempt)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Outbox tasks
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@celery_app.task(name="outbox_beat")
+def outbox_beat() -> None:
+    """Beat task — pull a batch of pending rows and enqueue per-row dispatches."""
+    try:
+        ids = _run_async(fetch_dispatch_batch(settings.OUTBOX_BATCH_SIZE))
+        for row_id in ids:
+            outbox_dispatch_one.apply_async(args=[row_id], queue=settings.QUEUE_OUTBOX)
+    except Exception:
+        logger.exception("outbox_beat_failed")
+
+
+@celery_app.task(name="outbox_dispatch_one", queue="outbox", acks_late=True)
+def outbox_dispatch_one(row_id: int) -> None:
+    _run_async(dispatch_row(row_id))
+
+
+@celery_app.task(name="outbox_reconcile_stuck")
+def outbox_reconcile_stuck() -> None:
+    """Beat task — reset rows stuck in 'in_progress' back to 'pending'."""
+    try:
+        _run_async(reconcile_stuck_in_progress(settings.OUTBOX_STUCK_THRESHOLD_SECONDS))
+    except Exception:
+        logger.exception("outbox_reconcile_failed")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TPM ledger sweeper + pressure gauge publisher
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@celery_app.task(name="ledger_sweep_expired")
+def ledger_sweep_expired() -> None:
+    """Beat task — reclaim stranded TPM ledger reservations (§4.5)."""
+    try:
+        count = _run_async(tpm_ledger.sweep_expired_reservations())
+        if count:
+            logger.info("ledger_sweep_completed", extra={"expired_count": count})
+    except Exception:
+        logger.exception("ledger_sweep_failed")
+
+
+@celery_app.task(name="pressure_publish")
+def pressure_publish() -> None:
+    """Beat task — refresh the platform_pressure gauge (§4.9)."""
+    try:
+        _run_async(publish_pressure())
+    except Exception:
+        logger.exception("pressure_publish_failed")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Recording reconciliation beat
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@celery_app.task(name="recording_reconcile_stuck")
+def recording_reconcile_stuck() -> None:
+    """
+    Beat task — recover interactions stuck in `recording_status='uploading'`
+    (the §7.6 reconciliation path). For v1 we mark them fetch_error and let
+    ops decide; production HEAD-checks S3 first.
+    """
+    try:
+        ids = _run_async(find_stuck_uploads(settings.RECORDING_STUCK_THRESHOLD_SECONDS))
+        for iid in ids:
+            _run_async(update_recording_status(
+                iid, "fetch_error", is_terminal=True, bump_attempt=False,
+            ))
+        if ids:
+            logger.warning("recording_stuck_recovered",
+                           extra={"count": len(ids), "ids_sample": ids[:10]})
+    except Exception:
+        logger.exception("recording_reconcile_failed")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+async def _load_interaction(interaction_id: str):
+    async with async_session_factory() as session:
+        result = await session.execute(
+            text(
+                """
+                SELECT id, session_id, lead_id, campaign_id, customer_id, agent_id,
+                       conversation_data, status
+                FROM interactions WHERE id = CAST(:id AS uuid)
+                """
+            ),
+            {"id": interaction_id},
+        )
+        row = result.first()
+        if row is None:
+            return None
+        return {
+            "id": row[0],
+            "session_id": row[1],
+            "lead_id": row[2],
+            "campaign_id": row[3],
+            "customer_id": row[4],
+            "agent_id": row[5],
+            "conversation_data": row[6],
+            "status": row[7],
+        }
+
+
+async def _update_interaction_lane(interaction_id: str, lane: str, verdict) -> None:
+    async with async_session_factory() as session:
+        await session.execute(
+            text(
+                """
+                UPDATE interactions
+                SET lane = :lane,
+                    classifier_verdict = CAST(:verdict AS jsonb),
+                    status = CASE WHEN :lane = 'skip' THEN 'ANALYSIS_SKIPPED' ELSE 'ANALYZING' END,
+                    updated_at = NOW()
+                WHERE id = CAST(:id AS uuid)
+                """
+            ),
+            {
+                "id": interaction_id,
+                "lane": lane,
+                "verdict": json.dumps({
+                    "lane": verdict.lane,
+                    "suggested_call_stage": verdict.suggested_call_stage,
+                    "matched_rules": verdict.matched_rules,
+                }),
+            },
+        )
+        await session.commit()

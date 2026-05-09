@@ -12,6 +12,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./data/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ./data/migrations/V2_postcall_pipeline.sql:/docker-entrypoint-initdb.d/02-postcall-pipeline.sql
 
   redis:
     image: redis:7-alpine
